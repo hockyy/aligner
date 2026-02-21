@@ -17,6 +17,16 @@ function snapToNearest(value: number, snaps: number[]): number {
   return nearest;
 }
 
+type LayerRefs = {
+  bodyTopY: number;
+  faceBottomY: number;
+  bodyBottomY: number;
+  eyeLeftX: number;
+  eyeLeftY: number;
+  eyeRightX: number;
+  eyeRightY: number;
+};
+
 type ImageLayer = {
   id: string;
   src: string;
@@ -26,11 +36,31 @@ type ImageLayer = {
   height: number;
   aspectRatio: number;
   visible: boolean;
+  refs?: LayerRefs;
 };
 
 const ACCEPTED_TYPES = ["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"];
 
 const RESIZE_HANDLES = ["n", "s", "e", "w", "nw", "ne", "sw", "se"] as const;
+
+/** Convert image-space (0–1) coords to canvas coords. Uses object-contain letterboxing. */
+function imageToCanvas(
+  layer: { x: number; y: number; width: number; height: number; aspectRatio: number },
+  u: number,
+  v: number
+): { x: number; y: number } {
+  const { x, y, width, height, aspectRatio: R } = layer;
+  const divRatio = width / height;
+  if (divRatio > R) {
+    const imgW = height * R;
+    const left = (width - imgW) / 2;
+    return { x: x + left + u * imgW, y: y + v * height };
+  } else {
+    const imgH = width / R;
+    const top = (height - imgH) / 2;
+    return { x: x + u * width, y: y + top + v * imgH };
+  }
+}
 
 function getHandleStyle(handle: string) {
   const base = "absolute z-10 h-3 w-3 rounded-full border-2 border-amber-500 bg-zinc-900";
@@ -78,14 +108,19 @@ export default function ImageAligner() {
   const [opacityUnselected, setOpacityUnselected] = useState(1);
   const [opacitySelected, setOpacitySelected] = useState(1);
   const [showBorders, setShowBorders] = useState(true);
-  const [guideH1, setGuideH1] = useState(0.33);
-  const [guideH2, setGuideH2] = useState(0.67);
+  const [guideH1, setGuideH1] = useState(0.2);
+  const [guideH2, setGuideH2] = useState(0.5);
+  const [guideH3, setGuideH3] = useState(0.8);
   const [guideV1, setGuideV1] = useState(0.33);
   const [guideV2, setGuideV2] = useState(0.67);
+  const [alignModalOpen, setAlignModalOpen] = useState(false);
+  const [alignModalLayerIndex, setAlignModalLayerIndex] = useState(0);
+  const [alignModalStep, setAlignModalStep] = useState(0);
+  const [alignWarning, setAlignWarning] = useState<string | null>(null);
   const [snapToLayerCenters, setSnapToLayerCenters] = useState(true);
   const [showGuideLines, setShowGuideLines] = useState(true);
   const [guideLinesLocked, setGuideLinesLocked] = useState(false);
-  const [draggingGuide, setDraggingGuide] = useState<"h1" | "h2" | "v1" | "v2" | null>(null);
+  const [draggingGuide, setDraggingGuide] = useState<"h1" | "h2" | "h3" | "v1" | "v2" | null>(null);
   const [draggedLayerId, setDraggedLayerId] = useState<string | null>(null);
   const [canUndo, setCanUndo] = useState(false);
   const hasInitializedOpacity = useRef(false);
@@ -104,6 +139,8 @@ export default function ImageAligner() {
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const alignModalCanvasRef = useRef<HTMLDivElement>(null);
+  const [alignModalHover, setAlignModalHover] = useState<{ x: number; y: number } | null>(null);
   const historyRef = useRef<ImageLayer[][]>([]);
   const layersRef = useRef<ImageLayer[]>([]);
   const pendingUndoStateRef = useRef<ImageLayer[] | null>(null);
@@ -115,7 +152,11 @@ export default function ImageAligner() {
   const MAX_HISTORY = 50;
 
   const pushHistory = useCallback(() => {
-    const state = layersRef.current.map((l) => ({ ...l, visible: l.visible !== false }));
+    const state = layersRef.current.map((l) => ({
+      ...l,
+      visible: l.visible !== false,
+      refs: l.refs ? { ...l.refs } : undefined,
+    }));
     historyRef.current.push(state);
     if (historyRef.current.length > MAX_HISTORY) {
       historyRef.current.shift();
@@ -331,7 +372,7 @@ export default function ImageAligner() {
   }, [selectedId, pushHistory]);
 
   const handleGuideMouseDown = useCallback(
-    (e: React.MouseEvent, guide: "h1" | "h2" | "v1" | "v2") => {
+    (e: React.MouseEvent, guide: "h1" | "h2" | "h3" | "v1" | "v2") => {
       e.stopPropagation();
       if (guideLinesLocked) return;
       setDraggingGuide(guide);
@@ -344,6 +385,7 @@ export default function ImageAligner() {
       const target = e.target as HTMLElement;
       if (target.closest("[data-resize-handle]") || target.closest("[data-guide-line]")) return;
       e.stopPropagation();
+      if (alignModalOpen) return;
       setSelectedId(id);
       const layer = layers.find((l) => l.id === id);
       if (!layer) return;
@@ -354,7 +396,7 @@ export default function ImageAligner() {
       };
       setIsDragging(true);
     },
-    [layers]
+    [layers, alignModalOpen]
   );
 
   const handleResizeMouseDown = useCallback(
@@ -394,7 +436,7 @@ export default function ImageAligner() {
               (l) => (l.x + l.width / 2) / rect.width
             );
             const threshold = 0.02;
-            if (draggingGuide === "h1" || draggingGuide === "h2") {
+            if (draggingGuide === "h1" || draggingGuide === "h2" || draggingGuide === "h3") {
               const snapped = snapToNearest(y, ySnaps);
               if (Math.abs(y - snapped) < threshold) y = snapped;
             } else {
@@ -404,6 +446,7 @@ export default function ImageAligner() {
           }
           if (draggingGuide === "h1") setGuideH1(y);
           if (draggingGuide === "h2") setGuideH2(y);
+          if (draggingGuide === "h3") setGuideH3(y);
           if (draggingGuide === "v1") setGuideV1(x);
           if (draggingGuide === "v2") setGuideV2(x);
         }
@@ -504,10 +547,210 @@ export default function ImageAligner() {
     }
   }, [layers]);
 
-  const handleLayerClick = useCallback((e: React.MouseEvent, id: string) => {
-    e.stopPropagation();
-    setSelectedId(id);
+  const handleAlignModalCanvasClick = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!alignModalOpen || !layers[alignModalLayerIndex]) return;
+      e.stopPropagation();
+      const target = e.currentTarget;
+      const rect = target.getBoundingClientRect();
+      const localX = (e.clientX - rect.left) / rect.width;
+      const localY = (e.clientY - rect.top) / rect.height;
+      const clampedX = Math.max(0, Math.min(1, localX));
+      const clampedY = Math.max(0, Math.min(1, localY));
+      const id = layers[alignModalLayerIndex].id;
+
+      const stepKeys: (keyof LayerRefs)[] = [
+        "bodyTopY",
+        "faceBottomY",
+        "bodyBottomY",
+        "eyeLeftX",
+        "eyeRightX",
+      ];
+      const key = stepKeys[alignModalStep];
+
+      setLayers((prev) =>
+        prev.map((l) => {
+          if (l.id !== id) return l;
+          const refs = { ...(l.refs ?? defaultRefs()) };
+          if (key === "bodyTopY") refs.bodyTopY = clampedY;
+          if (key === "faceBottomY") refs.faceBottomY = clampedY;
+          if (key === "bodyBottomY") refs.bodyBottomY = clampedY;
+          if (key === "eyeLeftX") {
+            refs.eyeLeftX = clampedX;
+            refs.eyeLeftY = clampedY;
+          }
+          if (key === "eyeRightX") {
+            refs.eyeRightX = clampedX;
+            refs.eyeRightY = clampedY;
+          }
+          return { ...l, refs };
+        })
+      );
+      if (alignModalStep < 4) {
+        setAlignModalStep((s) => s + 1);
+      } else {
+        if (alignModalLayerIndex < layers.length - 1) {
+          setAlignModalLayerIndex((i) => i + 1);
+          setAlignModalStep(0);
+        }
+      }
+    },
+    [alignModalOpen, alignModalLayerIndex, alignModalStep, layers]
+  );
+
+  const handleAlignModalCanvasMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      const target = e.currentTarget;
+      const rect = target.getBoundingClientRect();
+      const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+      setAlignModalHover({ x, y });
+    },
+    []
+  );
+
+  const handleAlignModalCanvasMouseLeave = useCallback(() => {
+    setAlignModalHover(null);
   }, []);
+
+  const handleAlignModalNext = useCallback(() => {
+    if (alignModalStep < 4) {
+      setAlignModalStep((s) => s + 1);
+    } else if (alignModalLayerIndex < layers.length - 1) {
+      setAlignModalLayerIndex((i) => i + 1);
+      setAlignModalStep(0);
+    }
+  }, [alignModalStep, alignModalLayerIndex, layers.length]);
+
+  const handleAlignModalPrev = useCallback(() => {
+    if (alignModalStep > 0) {
+      setAlignModalStep((s) => s - 1);
+    } else if (alignModalLayerIndex > 0) {
+      setAlignModalLayerIndex((i) => i - 1);
+      setAlignModalStep(4);
+    }
+  }, [alignModalStep, alignModalLayerIndex]);
+
+  const handleLayerClick = useCallback(
+    (e: React.MouseEvent, id: string, _layer: ImageLayer) => {
+      e.stopPropagation();
+      if (alignModalOpen) return;
+      setSelectedId(id);
+    },
+    [alignModalOpen]
+  );
+
+  function defaultRefs(): LayerRefs {
+    return {
+      bodyTopY: 0.2,
+      faceBottomY: 0.5,
+      bodyBottomY: 0.8,
+      eyeLeftX: 0.35,
+      eyeLeftY: 0.45,
+      eyeRightX: 0.65,
+      eyeRightY: 0.45,
+    };
+  }
+
+  const runAutoAlign = useCallback(() => {
+    if (layers.length < 2) return;
+    setAlignWarning(null);
+
+    const refLayer = layers[0];
+    const refRefs = refLayer.refs ?? defaultRefs();
+
+    const refEyeLeft = imageToCanvas(refLayer, refRefs.eyeLeftX, refRefs.eyeLeftY);
+    const refEyeRight = imageToCanvas(refLayer, refRefs.eyeRightX, refRefs.eyeRightY);
+    const refBodyTop = imageToCanvas(refLayer, 0.5, refRefs.bodyTopY);
+    const refFaceBottom = imageToCanvas(refLayer, 0.5, refRefs.faceBottomY);
+    const refBodyBottom = imageToCanvas(refLayer, 0.5, refRefs.bodyBottomY);
+
+    const refEyeSpanX = refEyeRight.x - refEyeLeft.x;
+    const refBodyFaceSpanY = refFaceBottom.y - refBodyTop.y;
+    const refBodySpanY = refBodyBottom.y - refBodyTop.y;
+
+    const refEyeCenterX = (refEyeLeft.x + refEyeRight.x) / 2;
+    const refBodyFaceMidY = (refBodyTop.y + refFaceBottom.y) / 2;
+
+    pushHistory();
+    const warnings: string[] = [];
+    setLayers((prev) =>
+      prev.map((layer, idx) => {
+        if (idx === 0) return layer;
+        const refs = layer.refs ?? defaultRefs();
+        const dxEye = refs.eyeRightX - refs.eyeLeftX;
+        const dyFaceBody = refs.faceBottomY - refs.bodyTopY;
+        const dyBody = refs.bodyBottomY - refs.bodyTopY;
+
+        if (Math.abs(dxEye) < 0.01) return layer;
+        if (Math.abs(dyFaceBody) < 0.01) return layer;
+
+        const eyeCenterFrac = (refs.eyeLeftX + refs.eyeRightX) / 2;
+        const bodyFaceMidFrac = (refs.bodyTopY + refs.faceBottomY) / 2;
+
+        const newWidth = refEyeSpanX / dxEye;
+        const newHeight = refBodyFaceSpanY / dyFaceBody;
+
+        const newLayer = {
+          ...layer,
+          x: 0,
+          y: 0,
+          width: newWidth,
+          height: newHeight,
+          aspectRatio: layer.aspectRatio,
+        };
+        const divRatio = newWidth / newHeight;
+        const R = layer.aspectRatio;
+
+        let newX: number;
+        let newY: number;
+        if (divRatio > R) {
+          const imgW = newHeight * R;
+          const left = (newWidth - imgW) / 2;
+          newX = refEyeCenterX - left - eyeCenterFrac * imgW;
+          newY = refBodyFaceMidY - bodyFaceMidFrac * newHeight;
+        } else {
+          const imgH = newWidth / R;
+          const top = (newHeight - imgH) / 2;
+          newX = refEyeCenterX - eyeCenterFrac * newWidth;
+          newY = refBodyFaceMidY - top - bodyFaceMidFrac * imgH;
+        }
+
+        if (Math.abs(dyBody) >= 0.01) {
+          const resultLayer = { ...layer, x: newX, y: newY, width: newWidth, height: newHeight };
+          const ourBodyBottom = imageToCanvas(resultLayer, 0.5, refs.bodyBottomY).y;
+          const bodyBottomGap = Math.abs(ourBodyBottom - refBodyBottom.y);
+          const refFaceToBody = (refRefs.faceBottomY - refRefs.bodyTopY) / (refRefs.bodyBottomY - refRefs.bodyTopY);
+          const layerFaceToBody = dyFaceBody / dyBody;
+          const positionMismatch = bodyBottomGap > Math.min(refBodySpanY, 50) * 0.2;
+          const proportionMismatch = Math.abs(refFaceToBody - layerFaceToBody) > 0.15;
+          if (positionMismatch || proportionMismatch) {
+            warnings.push(`Layer ${idx + 1}: body bottom doesn't match reference`);
+          }
+        }
+
+        return {
+          ...layer,
+          x: newX,
+          y: newY,
+          width: newWidth,
+          height: newHeight,
+        };
+      })
+    );
+    if (warnings.length > 0) {
+      setAlignWarning(warnings.join("; "));
+    }
+    setAlignModalOpen(false);
+  }, [layers, pushHistory]);
+
+  const handleAutoAlignClick = useCallback(() => {
+    if (layers.length < 1) return;
+    setAlignWarning(null);
+    setAlignModalOpen(true);
+    setAlignModalLayerIndex(0);
+    setAlignModalStep(0);
+  }, [layers.length]);
 
   const selectedLayerIndex = selectedId ? layers.findIndex((l) => l.id === selectedId) + 1 : 0;
 
@@ -679,6 +922,20 @@ export default function ImageAligner() {
               />
               <span className="text-xs text-zinc-400">Snap to centers</span>
             </label>
+            <button
+              type="button"
+              onClick={handleAutoAlignClick}
+              disabled={layers.length < 1}
+              className="rounded bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40"
+              title="Set reference points then align layers to first"
+            >
+              Auto align
+            </button>
+            {alignWarning && (
+              <div className="rounded bg-amber-900/80 px-2 py-1 text-xs text-amber-200">
+                {alignWarning}
+              </div>
+            )}
             {selectedId && (
               <>
                 <span className="text-sm text-amber-400">
@@ -839,7 +1096,9 @@ export default function ImageAligner() {
             <p className="text-zinc-500">Import images to get started</p>
           </div>
         ) : (
-          layers.map((layer) => (
+          layers.map((layer, idx) => {
+            const isAlignTarget = alignModalOpen && idx === alignModalLayerIndex;
+            return (
             <div
               key={layer.id}
               className="absolute cursor-move select-none"
@@ -848,11 +1107,15 @@ export default function ImageAligner() {
                 top: layer.y,
                 width: layer.width,
                 height: layer.height,
-                zIndex: selectedId === layer.id ? 100 : layers.indexOf(layer),
+                zIndex: isAlignTarget
+                  ? 250
+                  : selectedId === layer.id
+                    ? 100
+                    : layers.indexOf(layer),
                 visibility: layer.visible === false ? "hidden" : "visible",
                 pointerEvents: layer.visible === false ? "none" : "auto",
               }}
-              onClick={(e) => handleLayerClick(e, layer.id)}
+              onClick={(e) => handleLayerClick(e, layer.id, layer)}
               onMouseDown={(e) => handleLayerMouseDown(e, layer.id)}
             >
               <img
@@ -861,12 +1124,14 @@ export default function ImageAligner() {
                 draggable={false}
                 className="pointer-events-none h-full w-full object-contain"
                 style={{
-                  opacity: selectedId === layer.id ? opacitySelected : opacityUnselected,
-                  border: showBorders
-                    ? selectedId === layer.id
-                      ? "2px solid rgb(245 158 11)"
-                      : "1px solid rgb(82 82 91)"
-                    : "none",
+                  opacity: isAlignTarget ? 1 : selectedId === layer.id ? opacitySelected : opacityUnselected,
+                  border: isAlignTarget
+                    ? "3px solid rgb(34 211 238)"
+                    : showBorders
+                      ? selectedId === layer.id
+                        ? "2px solid rgb(245 158 11)"
+                        : "1px solid rgb(82 82 91)"
+                      : "none",
                   borderRadius: 4,
                 }}
               />
@@ -886,15 +1151,16 @@ export default function ImageAligner() {
                   );
                 })}
             </div>
-          ))
+            );
+          })
         )}
         {/* Guide lines hint */}
-        {layers.length > 0 && showGuideLines && (
+        {layers.length > 0 && showGuideLines && !alignModalOpen && (
           <div
-            className="absolute bottom-2 left-2 z-[150] max-w-[200px] rounded bg-zinc-800/90 px-2 py-1.5 text-xs text-zinc-400"
-            title="Drag the cyan guide lines to align face, body, or eyes across layers"
+            className="absolute bottom-2 left-2 z-[150] max-w-[220px] rounded bg-zinc-800/90 px-2 py-1.5 text-xs text-zinc-400"
+            title="Click Auto align to set ref points per layer, then apply"
           >
-            Drag guide lines to align face, body, or eyes
+            Auto align: set 5 ref points per layer (first = reference)
           </div>
         )}
         {/* Layer center snap lines (when snap to centers is on) */}
@@ -933,6 +1199,15 @@ export default function ImageAligner() {
               <div className="h-px w-full bg-cyan-500/90" />
             </div>
             <div
+              className={`absolute left-0 right-0 z-[200] h-3 -translate-y-1/2 py-1 ${guideLinesLocked ? "cursor-default" : "cursor-ns-resize"}`}
+              style={{ top: `${guideH3 * 100}%` }}
+              data-guide-line
+              onClick={(e) => e.stopPropagation()}
+              onMouseDown={(e) => handleGuideMouseDown(e, "h3")}
+            >
+              <div className="h-px w-full bg-cyan-500/90" />
+            </div>
+            <div
               className={`absolute top-0 bottom-0 z-[200] w-3 -translate-x-1/2 px-1 ${guideLinesLocked ? "cursor-default" : "cursor-ew-resize"}`}
               style={{ left: `${guideV1 * 100}%` }}
               data-guide-line
@@ -954,6 +1229,118 @@ export default function ImageAligner() {
         )}
       </div>
       </div>
+
+      {/* Auto align modal - canvas UI with single image + guide lines */}
+      {alignModalOpen && layers.length > 0 && (() => {
+        const layer = layers[alignModalLayerIndex];
+        if (!layer) return null;
+        const refs = layer.refs ?? defaultRefs();
+        const stepLabels = ["Body top", "Face bottom", "Body bottom", "Eye left (tip)", "Eye right (tip)"];
+        const isYStep = alignModalStep <= 2;
+        const isEyeStep = alignModalStep >= 3;
+        const lineY = isYStep ? (alignModalHover?.y ?? (alignModalStep === 0 ? refs.bodyTopY : alignModalStep === 1 ? refs.faceBottomY : refs.bodyBottomY)) : (isEyeStep ? (alignModalHover?.y ?? (alignModalStep === 3 ? refs.eyeLeftY : refs.eyeRightY)) : 0.5);
+        const lineX = isEyeStep ? (alignModalHover?.x ?? (alignModalStep === 3 ? refs.eyeLeftX : refs.eyeRightX)) : (alignModalHover?.x ?? 0.5);
+
+        return (
+          <>
+            <div className="fixed inset-0 z-[290] bg-black/80" onClick={() => setAlignModalOpen(false)} />
+            <div className="fixed inset-0 z-[300] flex flex-col items-center justify-center p-6 pointer-events-none">
+              <div className="pointer-events-auto flex w-full max-w-7xl flex-col items-center">
+              <div className="mb-4 flex w-full items-center justify-between">
+                <h3 className="text-lg font-medium text-white">
+                  Layer {alignModalLayerIndex + 1} of {layers.length} — {stepLabels[alignModalStep]}
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setAlignModalOpen(false)}
+                  className="rounded p-2 text-zinc-400 hover:bg-zinc-700 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+              <div
+                ref={alignModalCanvasRef}
+                className="relative flex min-h-[500px] max-h-[90vh] w-full max-w-7xl flex-1 min-w-0 items-center justify-center overflow-auto rounded-lg border border-zinc-600 bg-zinc-900"
+              >
+                <div
+                  className="relative mx-auto my-auto shrink-0"
+                  style={{
+                    aspectRatio: layer.aspectRatio,
+                    maxHeight: "100%",
+                    maxWidth: "100%",
+                    width: layer.aspectRatio >= 1 ? "100%" : "auto",
+                    height: layer.aspectRatio >= 1 ? "auto" : "100%",
+                  }}
+                >
+                  <img
+                    src={layer.src}
+                    alt=""
+                    className="absolute inset-0 h-full w-full object-contain"
+                    draggable={false}
+                  />
+                  <div
+                    className="absolute inset-0 cursor-crosshair"
+                    onClick={handleAlignModalCanvasClick}
+                    onMouseMove={handleAlignModalCanvasMouseMove}
+                    onMouseLeave={handleAlignModalCanvasMouseLeave}
+                  >
+                    {/* Persistent XY indicator lines (all refs when set) */}
+                    <div className="pointer-events-none absolute inset-0">
+                      <div className="absolute left-0 right-0 h-px bg-cyan-400/50" style={{ top: `${refs.bodyTopY * 100}%` }} title="Body top" />
+                      <div className="absolute left-0 right-0 h-px bg-cyan-400/50" style={{ top: `${refs.faceBottomY * 100}%` }} title="Face bottom" />
+                      <div className="absolute left-0 right-0 h-px bg-cyan-400/50" style={{ top: `${refs.bodyBottomY * 100}%` }} title="Body bottom" />
+                      <div className="absolute top-0 bottom-0 w-px bg-cyan-400/50" style={{ left: `${refs.eyeLeftX * 100}%` }} title="Eye left" />
+                      <div className="absolute top-0 bottom-0 w-px bg-cyan-400/50" style={{ left: `${refs.eyeRightX * 100}%` }} title="Eye right" />
+                    </div>
+                    {/* Current step crosshair (brighter) */}
+                    {(isYStep || isEyeStep) && (
+                      <div
+                        className="pointer-events-none absolute left-0 right-0 h-0.5 bg-cyan-400 shadow-[0_0_4px_cyan]"
+                        style={{ top: `${lineY * 100}%` }}
+                      />
+                    )}
+                    {isEyeStep && (
+                      <div
+                        className="pointer-events-none absolute top-0 bottom-0 w-0.5 bg-cyan-400 shadow-[0_0_4px_cyan]"
+                        style={{ left: `${lineX * 100}%` }}
+                      />
+                    )}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-4 flex w-full max-w-7xl justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={handleAlignModalPrev}
+                  disabled={alignModalLayerIndex === 0 && alignModalStep === 0}
+                  className="rounded-lg bg-zinc-600 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-500 disabled:opacity-40"
+                >
+                  Prev
+                </button>
+                {alignModalLayerIndex === layers.length - 1 && alignModalStep === 4 ? (
+                  <button
+                    type="button"
+                    onClick={runAutoAlign}
+                    disabled={layers.length < 2}
+                    className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40"
+                  >
+                    Apply alignment
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleAlignModalNext}
+                    className="rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500"
+                  >
+                    Next
+                </button>
+              )}
+              </div>
+              </div>
+            </div>
+          </>
+        );
+      })()}
     </div>
   );
 }
